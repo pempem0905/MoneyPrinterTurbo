@@ -45,3 +45,6 @@ htmlcov/
 
 # Claude Code 订阅令牌（docker compose 自动读取），禁止提交
 .env
+
+# API-only engine local secrets. Commit only .env.engine.example.
+/.env.engine

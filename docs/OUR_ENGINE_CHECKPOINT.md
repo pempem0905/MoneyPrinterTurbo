@@ -26,6 +26,10 @@ Branch:
 
 This checkpoint does not change script generation, TTS, subtitles, material selection/generation, FFmpeg rendering, publishing providers, or the task queue implementation.
 
+## CI retrigger note
+
+A documentation-only commit was pushed on 2026-09-11 to retrigger the pull-request workflow after the fork initially reported no workflow runs. No runtime or generation logic was changed by this retrigger.
+
 ## Next batch after CI passes
 
 1. Add a stable app-facing adapter contract so our app does not depend directly on every upstream request field.

@@ -6,6 +6,7 @@ FastAPI is imported by Uvicorn.
 """
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -82,6 +83,18 @@ def configure_runtime() -> None:
 
     if api_key:
         config.app["api_key"] = api_key
+
+    # MoviePy otherwise defaults to imageio-ffmpeg's bundled binary. In cloud
+    # containers we already install Debian's FFmpeg and verify it separately;
+    # use that exact binary for MoviePy too so the read/write pipeline does not
+    # mix two different FFmpeg builds (a common source of silent BrokenPipe
+    # failures while writing intermediate clips).
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        os.environ["IMAGEIO_FFMPEG_EXE"] = system_ffmpeg
+        os.environ["FFMPEG_BINARY"] = system_ffmpeg
+        config.app["ffmpeg_path"] = system_ffmpeg
+        logger.info("MoviePy FFmpeg pinned to {}", system_ffmpeg)
 
     config.listen_host = os.getenv("MPT_LISTEN_HOST", "0.0.0.0").strip() or "0.0.0.0"
 

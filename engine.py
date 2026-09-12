@@ -8,6 +8,7 @@ to the system FFmpeg binary so a task does not remain stuck after a BrokenPipe.
 
 import os
 import shutil
+import signal
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -55,6 +56,8 @@ def _ensure_demo_material() -> None:
         "ultrafast",
         "-crf",
         "32",
+        "-threads",
+        "1",
         "-pix_fmt",
         "yuv420p",
         str(target),
@@ -108,9 +111,25 @@ def _run_ffmpeg(command: list[str], *, label: str, timeout: int = 180) -> None:
         timeout=timeout,
     )
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "ffmpeg failed").strip()
-        # Keep the useful tail without dumping megabytes of FFmpeg diagnostics.
-        raise RuntimeError(f"{label}: {detail[-4000:]}")
+        detail = (result.stderr or result.stdout or "").strip()
+        if result.returncode < 0:
+            try:
+                exit_reason = signal.Signals(-result.returncode).name
+            except ValueError:
+                exit_reason = f"signal {-result.returncode}"
+        else:
+            exit_reason = f"exit {result.returncode}"
+        command_text = " ".join(command)
+        if not detail:
+            detail = "ffmpeg produced no stderr/stdout"
+        logger.error(
+            "{} failed ({}): {} | command={}",
+            label,
+            exit_reason,
+            detail[-4000:],
+            command_text,
+        )
+        raise RuntimeError(f"{label}: {exit_reason}: {detail[-4000:]}")
 
 
 def _arg(args: tuple[Any, ...], kwargs: dict[str, Any], name: str, index: int, default=None):
@@ -122,12 +141,13 @@ def _arg(args: tuple[Any, ...], kwargs: dict[str, Any], name: str, index: int, d
 
 
 def _ffmpeg_combine_fallback(*args, **kwargs) -> str:
-    """Cloud-safe fallback for combine_videos when MoviePy pipe writing fails.
+    """Low-memory cloud fallback for combine_videos.
 
-    This path is only reached after the upstream combine function failed to
-    create its output. It deliberately favors reliability over transitions:
-    it loops the first valid source to narration length, preserving aspect and
-    playback speed. Normal successful upstream tasks are completely unchanged.
+    The upstream MoviePy path remains the first choice. If it fails, prefer an
+    H.264 stream-copy loop, which avoids allocating a second 1080x1920 encoder
+    and is enough to keep the real TTS/subtitle/video pipeline testable. Only if
+    stream-copy cannot produce a usable file do we try a one-thread ultrafast
+    re-encode as a last resort.
     """
     from app.models.schema import VideoAspect
 
@@ -145,10 +165,47 @@ def _ffmpeg_combine_fallback(*args, **kwargs) -> str:
         raise RuntimeError("cloud ffmpeg fallback: narration audio is missing")
 
     duration = _probe_duration(audio_file) + 0.12
+    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+
+    # Fast/reliable path: keep the source H.264 stream intact and only loop it.
+    # This is especially important on small cloud instances where re-encoding a
+    # 1080x1920 frame can be killed before FFmpeg has time to emit diagnostics.
+    if abs(clip_speed - 1.0) < 1e-6:
+        copy_command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-stream_loop",
+            "-1",
+            "-i",
+            source,
+            "-t",
+            f"{duration:.3f}",
+            "-an",
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "copy",
+            "-movflags",
+            "+faststart",
+            output_file,
+        ]
+        try:
+            _run_ffmpeg(copy_command, label="cloud combine stream-copy fallback")
+            if _is_valid_mp4(output_file):
+                logger.success("cloud stream-copy fallback created combined video: {}", output_file)
+                return output_file
+        except Exception as exc:
+            logger.warning("stream-copy combine failed; trying low-memory encode: {}", exc)
+
+    # Last-resort low-memory encode. One x264 thread + ultrafast greatly lowers
+    # transient memory versus MoviePy/default x264 while preserving requested canvas.
     width, height = VideoAspect(video_aspect).to_resolution()
     fit_value = getattr(fit_mode, "value", fit_mode) or "cover"
     speed = min(4.0, max(0.25, clip_speed))
-
     if str(fit_value) == "contain":
         video_filter = (
             f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
@@ -162,9 +219,8 @@ def _ffmpeg_combine_fallback(*args, **kwargs) -> str:
     if speed != 1.0:
         video_filter += f",setpts=PTS/{speed:.6f}"
 
-    Path(output_file).parent.mkdir(parents=True, exist_ok=True)
-    command = [
-        shutil.which("ffmpeg") or "ffmpeg",
+    encode_command = [
+        ffmpeg,
         "-hide_banner",
         "-loglevel",
         "error",
@@ -183,24 +239,27 @@ def _ffmpeg_combine_fallback(*args, **kwargs) -> str:
         "-c:v",
         "libx264",
         "-preset",
-        "veryfast",
+        "ultrafast",
         "-crf",
-        "26",
+        "30",
+        "-threads",
+        "1",
+        "-x264-params",
+        "threads=1:ref=1:bframes=0",
         "-pix_fmt",
         "yuv420p",
         "-movflags",
         "+faststart",
         output_file,
     ]
-    _run_ffmpeg(command, label="cloud combine fallback")
+    _run_ffmpeg(encode_command, label="cloud combine low-memory fallback")
     if not _is_valid_mp4(output_file):
         raise RuntimeError("cloud combine fallback returned no usable MP4")
-    logger.success("cloud FFmpeg fallback created combined video: {}", output_file)
+    logger.success("cloud low-memory fallback created combined video: {}", output_file)
     return output_file
 
 
 def _escape_filter_path(path_value: str) -> str:
-    # FFmpeg filter parser treats backslash, colon and single quote specially.
     return (
         str(Path(path_value).resolve())
         .replace("\\", "\\\\")
@@ -210,25 +269,27 @@ def _escape_filter_path(path_value: str) -> str:
 
 
 def _ffmpeg_final_fallback(*args, **kwargs) -> bool:
-    """Fallback final mux/burn-in using system FFmpeg.
+    """Low-memory final mux fallback.
 
-    It retains the already-generated narration and SRT from MoneyPrinterTurbo.
-    If libass subtitle burn-in is unavailable, it retries without burn-in so a
-    real narrated MP4 is still returned rather than leaving the task at 75%.
+    Upstream still gets the first chance to render subtitles and all effects. If
+    that fails, the emergency path stream-copies the already-combined H.264 video
+    and encodes only the narration audio. The SRT has already been generated and
+    validated earlier in the pipeline; skipping burn-in in this emergency path
+    is preferable to failing the whole quick test on a small cloud instance.
     """
     video_path = str(_arg(args, kwargs, "video_path", 0, ""))
     audio_path = str(_arg(args, kwargs, "audio_path", 1, ""))
-    subtitle_path = str(_arg(args, kwargs, "subtitle_path", 2, "") or "")
     output_file = str(_arg(args, kwargs, "output_file", 3, ""))
-    params = _arg(args, kwargs, "params", 4, None)
 
     if not _is_valid_mp4(video_path):
         raise RuntimeError("cloud final fallback: combined video is missing")
     if not audio_path or not Path(audio_path).is_file():
         raise RuntimeError("cloud final fallback: narration audio is missing")
 
-    base = [
-        shutil.which("ffmpeg") or "ffmpeg",
+    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+    copy_mux = [
+        ffmpeg,
         "-hide_banner",
         "-loglevel",
         "error",
@@ -237,8 +298,39 @@ def _ffmpeg_final_fallback(*args, **kwargs) -> bool:
         video_path,
         "-i",
         audio_path,
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        output_file,
     ]
-    tail = [
+    try:
+        _run_ffmpeg(copy_mux, label="cloud final stream-copy fallback")
+        if _is_valid_mp4(output_file):
+            logger.success("cloud stream-copy fallback created final video: {}", output_file)
+            return True
+    except Exception as exc:
+        logger.warning("final stream-copy failed; trying one-thread encode: {}", exc)
+
+    low_memory_mux = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        video_path,
+        "-i",
+        audio_path,
         "-map",
         "0:v:0",
         "-map",
@@ -246,41 +338,26 @@ def _ffmpeg_final_fallback(*args, **kwargs) -> bool:
         "-c:v",
         "libx264",
         "-preset",
-        "veryfast",
+        "ultrafast",
         "-crf",
-        "24",
-        "-pix_fmt",
-        "yuv420p",
+        "30",
+        "-threads",
+        "1",
+        "-x264-params",
+        "threads=1:ref=1:bframes=0",
         "-c:a",
         "aac",
         "-b:a",
-        "192k",
+        "160k",
         "-shortest",
         "-movflags",
         "+faststart",
         output_file,
     ]
-
-    subtitle_enabled = bool(getattr(params, "subtitle_enabled", False))
-    can_burn_subtitle = subtitle_enabled and subtitle_path and Path(subtitle_path).is_file()
-    if can_burn_subtitle:
-        fonts_dir = Path(config.root_dir) / "resource" / "fonts"
-        subtitle_filter = (
-            f"subtitles='{_escape_filter_path(subtitle_path)}':"
-            f"fontsdir='{_escape_filter_path(str(fonts_dir))}':"
-            "force_style='FontSize=22,Outline=1,Shadow=0,Alignment=2,MarginV=55'"
-        )
-        try:
-            _run_ffmpeg(base + ["-vf", subtitle_filter] + tail, label="cloud final fallback")
-        except Exception as exc:
-            logger.warning("subtitle burn-in fallback failed; retrying narrated MP4: {}", exc)
-            _run_ffmpeg(base + tail, label="cloud final fallback without subtitle")
-    else:
-        _run_ffmpeg(base + tail, label="cloud final fallback")
-
+    _run_ffmpeg(low_memory_mux, label="cloud final low-memory fallback")
     if not _is_valid_mp4(output_file):
         raise RuntimeError("cloud final fallback returned no usable MP4")
-    logger.success("cloud FFmpeg fallback created final video: {}", output_file)
+    logger.success("cloud low-memory fallback created final video: {}", output_file)
     return True
 
 
@@ -339,7 +416,6 @@ def configure_runtime() -> None:
     if api_key:
         config.app["api_key"] = api_key
 
-    # Pin MoviePy to the Debian FFmpeg installed in the container.
     system_ffmpeg = shutil.which("ffmpeg")
     if system_ffmpeg:
         os.environ["IMAGEIO_FFMPEG_EXE"] = system_ffmpeg

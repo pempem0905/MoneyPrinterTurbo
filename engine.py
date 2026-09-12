@@ -6,6 +6,8 @@ FastAPI is imported by Uvicorn.
 """
 
 import os
+import subprocess
+from pathlib import Path
 
 import uvicorn
 from loguru import logger
@@ -18,6 +20,53 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _ensure_demo_material() -> None:
+    """Create one tiny local MP4 so the cloud engine can be smoke-tested without paid APIs.
+
+    The generated asset is only a neutral test pattern. It lets the mobile UI
+    exercise the real MoneyPrinterTurbo render path (local material -> Edge TTS
+    -> subtitles -> FFmpeg -> final MP4) before the user adds Pexels/LLM keys.
+    """
+
+    if not _env_flag("MPT_CREATE_DEMO_MATERIAL", True):
+        return
+
+    target_dir = Path(config.root_dir) / "storage" / "local_videos"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / "mpt-demo-vertical.mp4"
+    if target.is_file() and target.stat().st_size > 10_000:
+        return
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=1080x1920:rate=30",
+        "-t",
+        "8",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "32",
+        "-pix_fmt",
+        "yuv420p",
+        str(target),
+    ]
+    try:
+        subprocess.run(cmd, check=True, timeout=90)
+        logger.info("created built-in demo material: {}", target.name)
+    except Exception as exc:  # demo material must never block service startup
+        logger.warning("could not create demo material: {}", exc)
 
 
 def configure_runtime() -> None:
@@ -48,6 +97,7 @@ def configure_runtime() -> None:
 
 if __name__ == "__main__":
     configure_runtime()
+    _ensure_demo_material()
     logger.info(
         "start API-only video engine, host={}, port={}, auth={}",
         config.listen_host,

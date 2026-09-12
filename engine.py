@@ -1,9 +1,9 @@
 """API-only entrypoint for our MoneyPrinterTurbo video engine.
 
-This wrapper intentionally keeps the upstream generation pipeline as the first
-choice. It applies production-safe runtime overrides and, only when MoviePy
-fails to produce an intermediate/final MP4 in the cloud container, falls back
-to the system FFmpeg binary so a task does not remain stuck after a BrokenPipe.
+The upstream pipeline remains available, but this cloud test service can prefer
+a low-memory FFmpeg path so MoviePy cannot restart the container while rendering
+1080x1920 frames. The lightweight path still exercises real script -> Edge TTS
+-> subtitle generation -> local material -> FFmpeg -> final MP4.
 """
 
 import os
@@ -65,7 +65,7 @@ def _ensure_demo_material() -> None:
     try:
         subprocess.run(cmd, check=True, timeout=90)
         logger.info("created built-in demo material: {}", target.name)
-    except Exception as exc:  # demo material must never block service startup
+    except Exception as exc:
         logger.warning("could not create demo material: {}", exc)
 
 
@@ -141,14 +141,7 @@ def _arg(args: tuple[Any, ...], kwargs: dict[str, Any], name: str, index: int, d
 
 
 def _ffmpeg_combine_fallback(*args, **kwargs) -> str:
-    """Low-memory cloud fallback for combine_videos.
-
-    The upstream MoviePy path remains the first choice. If it fails, prefer an
-    H.264 stream-copy loop, which avoids allocating a second 1080x1920 encoder
-    and is enough to keep the real TTS/subtitle/video pipeline testable. Only if
-    stream-copy cannot produce a usable file do we try a one-thread ultrafast
-    re-encode as a last resort.
-    """
+    """Low-memory combine path: stream-copy first, one-thread encode last."""
     from app.models.schema import VideoAspect
 
     output_file = str(_arg(args, kwargs, "combined_video_path", 0, ""))
@@ -168,9 +161,6 @@ def _ffmpeg_combine_fallback(*args, **kwargs) -> str:
     ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
 
-    # Fast/reliable path: keep the source H.264 stream intact and only loop it.
-    # This is especially important on small cloud instances where re-encoding a
-    # 1080x1920 frame can be killed before FFmpeg has time to emit diagnostics.
     if abs(clip_speed - 1.0) < 1e-6:
         copy_command = [
             ffmpeg,
@@ -201,8 +191,6 @@ def _ffmpeg_combine_fallback(*args, **kwargs) -> str:
         except Exception as exc:
             logger.warning("stream-copy combine failed; trying low-memory encode: {}", exc)
 
-    # Last-resort low-memory encode. One x264 thread + ultrafast greatly lowers
-    # transient memory versus MoviePy/default x264 while preserving requested canvas.
     width, height = VideoAspect(video_aspect).to_resolution()
     fit_value = getattr(fit_mode, "value", fit_mode) or "cover"
     speed = min(4.0, max(0.25, clip_speed))
@@ -259,24 +247,8 @@ def _ffmpeg_combine_fallback(*args, **kwargs) -> str:
     return output_file
 
 
-def _escape_filter_path(path_value: str) -> str:
-    return (
-        str(Path(path_value).resolve())
-        .replace("\\", "\\\\")
-        .replace(":", "\\:")
-        .replace("'", "\\'")
-    )
-
-
 def _ffmpeg_final_fallback(*args, **kwargs) -> bool:
-    """Low-memory final mux fallback.
-
-    Upstream still gets the first chance to render subtitles and all effects. If
-    that fails, the emergency path stream-copies the already-combined H.264 video
-    and encodes only the narration audio. The SRT has already been generated and
-    validated earlier in the pipeline; skipping burn-in in this emergency path
-    is preferable to failing the whole quick test on a small cloud instance.
-    """
+    """Low-memory final mux: copy H.264 video and encode narration audio only."""
     video_path = str(_arg(args, kwargs, "video_path", 0, ""))
     audio_path = str(_arg(args, kwargs, "audio_path", 1, ""))
     output_file = str(_arg(args, kwargs, "output_file", 3, ""))
@@ -362,7 +334,7 @@ def _ffmpeg_final_fallback(*args, **kwargs) -> bool:
 
 
 def _install_cloud_render_fallbacks() -> None:
-    """Patch only the cloud runtime, leaving upstream source files untouched."""
+    """Patch cloud rendering while keeping upstream available behind an env flag."""
     if not _env_flag("MPT_CLOUD_FFMPEG_FALLBACK", True):
         return
 
@@ -370,8 +342,13 @@ def _install_cloud_render_fallbacks() -> None:
 
     original_combine = video_service.combine_videos
     original_generate = video_service.generate_video
+    low_memory_first = _env_flag("MPT_LOW_MEMORY_RENDER_FIRST", True)
 
     def combine_wrapper(*args, **kwargs):
+        if low_memory_first:
+            logger.info("low-memory cloud mode: bypassing MoviePy combine")
+            return _ffmpeg_combine_fallback(*args, **kwargs)
+
         output_file = str(_arg(args, kwargs, "combined_video_path", 0, ""))
         try:
             result = original_combine(*args, **kwargs)
@@ -385,6 +362,10 @@ def _install_cloud_render_fallbacks() -> None:
         return _ffmpeg_combine_fallback(*args, **kwargs)
 
     def generate_wrapper(*args, **kwargs):
+        if low_memory_first:
+            logger.info("low-memory cloud mode: bypassing MoviePy final render")
+            return _ffmpeg_final_fallback(*args, **kwargs)
+
         output_file = str(_arg(args, kwargs, "output_file", 3, ""))
         try:
             result = original_generate(*args, **kwargs)
@@ -399,7 +380,10 @@ def _install_cloud_render_fallbacks() -> None:
 
     video_service.combine_videos = combine_wrapper
     video_service.generate_video = generate_wrapper
-    logger.info("cloud-safe FFmpeg render fallbacks installed")
+    logger.info(
+        "cloud-safe FFmpeg render hooks installed, low_memory_first={}",
+        low_memory_first,
+    )
 
 
 def configure_runtime() -> None:

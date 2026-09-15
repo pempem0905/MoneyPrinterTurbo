@@ -1,0 +1,27 @@
+services:
+  video-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: "mpt-video-engine"
+    command: ["python3", "engine.py"]
+    env_file:
+      - .env.engine
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./config.toml:/MoneyPrinterTurbo/config.toml:ro
+      - ./storage:/MoneyPrinterTurbo/storage
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ping', timeout=5).read()",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped

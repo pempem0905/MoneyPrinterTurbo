@@ -1,0 +1,45 @@
+name: Engine CI
+
+on:
+  push:
+    branches:
+      - our-video-engine
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "engine.py"
+      - "docker-compose.engine.yml"
+      - ".env.engine.example"
+      - "test/test_engine_entrypoint.py"
+      - ".github/workflows/engine-ci.yml"
+
+jobs:
+  engine-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen --python 3.11
+
+      - name: Compile engine entrypoint
+        run: uv run --no-sync python -m compileall engine.py
+
+      - name: Lint engine files
+        run: uv run --no-sync ruff check engine.py test/test_engine_entrypoint.py
+
+      - name: Run engine entrypoint tests
+        run: uv run --no-sync python -X utf8 -m pytest -q test/test_engine_entrypoint.py

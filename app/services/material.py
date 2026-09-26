@@ -334,10 +334,37 @@ def search_videos_pexels(
             verify=_get_tls_verify(),
             timeout=(30, 60),
         )
-        response = r.json()
+        status_code = int(getattr(r, "status_code", 200))
+        headers_out = getattr(r, "headers", {}) or {}
+        content_type = str(headers_out.get("content-type", ""))
+        try:
+            response = r.json()
+        except ValueError:
+            logger.error(
+                "pexels returned a non-JSON response: "
+                f"status={status_code}, content_type={content_type or 'unknown'}"
+            )
+            return []
+
         video_items = []
-        if "videos" not in response:
-            logger.error("pexels video search returned an unsupported response")
+        if not isinstance(response, dict) or "videos" not in response:
+            safe_keys = (
+                sorted(str(key) for key in response.keys())[:12]
+                if isinstance(response, dict)
+                else []
+            )
+            safe_message = ""
+            if isinstance(response, dict):
+                for field in ("error", "message", "detail"):
+                    value = response.get(field)
+                    if isinstance(value, str) and value.strip():
+                        safe_message = value.strip()[:300]
+                        break
+            logger.error(
+                "pexels video search returned an unsupported response: "
+                f"status={status_code}, content_type={content_type or 'unknown'}, "
+                f"keys={safe_keys}, message={safe_message or 'none'}"
+            )
             return video_items
         videos = response["videos"]
         # loop through each video in the result

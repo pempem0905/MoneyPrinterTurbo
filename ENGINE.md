@@ -105,3 +105,40 @@ Do not expose `MPT_API_KEY` to browser code. The app backend should own all call
 - publishing providers
 
 Those stay upstream-compatible until separately audited and tested.
+
+## Capability report (Common OS integration)
+
+`GET /api/v1/capabilities` (same `x-api-key` protection as every `/api/v1` route) is a
+read-only report for server-to-server integrations. It returns:
+
+- `sources[]`: every material source id (`local`, `pexels`, `pixabay`, `coverr`, `wavespeed`,
+  `volcengine_seedance`, `ofox`, `metaso_minimax`, `loomloom`, `openai_image`) with `type`
+  (`local` | `stock` | `ai_video` | `ai_image`), `paid`, `configured`, `api_renderable`,
+  aspect support, `supports_scene_prompt`, `supports_direct_material` and `cost_warning`.
+- `music_providers[]`: paid music generators and whether they are configured.
+- `render_options`: the enum values / numeric bounds `POST /api/v1/videos` accepts.
+- `script_contract`: a non-empty `video_script` and non-empty `video_terms` are used verbatim
+  (no LLM call). `terms_may_be_reordered` is `true` only when TwelveLabs is configured and the
+  request leaves `match_materials_to_script=false`.
+- `direct_materials`: how explicit materials are honored (see below).
+
+`configured` values are booleans only. The endpoint never returns keys, tokens, provider base
+URLs or raw `config.toml` values. Secrets are still managed only through `config.toml`,
+environment variables, or the allowlisted `/api/v1/provider-config` route.
+
+### Explicit per-scene materials — exact limitation
+
+`video_materials` is honored **only** with `video_source="local"`. Each entry's `url` must be a
+file name inside the engine's `storage/local_videos` directory (upload with
+`POST /api/v1/video_materials`; path traversal is rejected). For every other source the engine
+searches/generates materials itself from `video_terms` and ignores `video_materials`.
+
+To mix providers per scene (shop media + Pexels + an AI clip), the caller resolves/downloads each
+scene's material, uploads it, then renders with `video_source="local"`,
+`video_concat_mode="sequential"` and the materials in scene order. In sequential mode each material
+contributes at most one `video_clip_duration`-long cut (scaled by `video_clip_speed`); the engine
+does not align cuts to per-scene narration timing. `source_info` on each material is persisted in
+the task's `script.json` for attribution.
+
+`loomloom` requires an interactive confirmed quote and cannot be started from
+`POST /api/v1/videos` (`api_renderable=false`).

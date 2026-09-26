@@ -635,6 +635,80 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     return subtitle_path
 
 
+_STAGING_PUBLIC_PEXELS_FALLBACKS = (
+    {
+        "video_id": "6278834",
+        "source_page": "https://www.pexels.com/video/mobile-phone-being-held-6278834/",
+        "creator": "Artem Podrez",
+    },
+    {
+        "video_id": "9305516",
+        "source_page": "https://www.pexels.com/video/a-person-using-cellphone-9305516/",
+        "creator": "Monstera Production",
+    },
+    {
+        "video_id": "8166027",
+        "source_page": "https://www.pexels.com/video/person-holding-smartphone-8166027/",
+        "creator": "MART PRODUCTION",
+    },
+    {
+        "video_id": "7657451",
+        "source_page": "https://www.pexels.com/video/a-person-using-a-smartphone-7657451/",
+        "creator": "Cup of Couple",
+    },
+)
+
+
+def _staging_public_stock_fallback(task_id: str) -> list[str]:
+    """STAGING-ONLY real-footage fallback when stock APIs are unavailable."""
+    enabled = str(os.getenv("MPT_STAGING_PUBLIC_FALLBACK", "") or "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return []
+
+    index = sum(ord(ch) for ch in str(task_id)) % len(_STAGING_PUBLIC_PEXELS_FALLBACKS)
+    selected = _STAGING_PUBLIC_PEXELS_FALLBACKS[index]
+    video_id = selected["video_id"]
+    download_url = (
+        f"https://www.pexels.com/download/video/{video_id}/?w=1080&h=1920"
+    )
+    logger.warning(
+        "STAGING ONLY: stock APIs returned no usable materials; "
+        f"using curated public Pexels fallback video_id={video_id}"
+    )
+    try:
+        saved_video_path = material.save_video(video_url=download_url)
+    except Exception as exc:
+        logger.error(
+            "STAGING ONLY public stock fallback download failed: "
+            f"video_id={video_id}, error={type(exc).__name__}, detail={exc}"
+        )
+        return []
+
+    if not saved_video_path:
+        return []
+
+    try:
+        task_artifacts.patch_script_data(
+            task_id,
+            material_sources=[
+                {
+                    "provider": "pexels_public_fallback",
+                    "asset_id": video_id,
+                    "source_page": selected["source_page"],
+                    "creator": selected["creator"],
+                    "search_term": "staging smartphone fallback",
+                    "local_file": path.basename(saved_video_path),
+                }
+            ],
+        )
+    except Exception as exc:
+        logger.warning(
+            "failed to persist STAGING ONLY fallback attribution: "
+            f"error={type(exc).__name__}, detail={exc}"
+        )
+    return [saved_video_path]
+
+
 def get_video_materials(
     task_id,
     params,
@@ -836,6 +910,9 @@ def get_video_materials(
                     )
                     downloaded_videos = fallback_videos
                     break
+
+        if not downloaded_videos:
+            downloaded_videos = _staging_public_stock_fallback(task_id)
 
         if not downloaded_videos:
             _mark_task_failed(

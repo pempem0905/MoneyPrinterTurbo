@@ -797,6 +797,46 @@ def get_video_materials(
                 details=details,
             )
             return None
+        # Pexels can occasionally return a valid JSON error/unsupported payload even
+        # when the key is present. For free-stock rendering, do not fail the whole
+        # task immediately: try the other configured free providers in a deterministic
+        # order. This preserves the prepared script/terms and never crosses into paid AI.
+        if not downloaded_videos and params.video_source == "pexels":
+            for fallback_source in ("pixabay", "coverr"):
+                logger.warning(
+                    "pexels returned no usable materials; "
+                    f"trying free fallback source={fallback_source}"
+                )
+                try:
+                    fallback_videos = material.download_videos(
+                        task_id=task_id,
+                        search_terms=video_terms,
+                        source=fallback_source,
+                        video_aspect=params.video_aspect,
+                        video_concat_mode=(
+                            VideoConcatMode.sequential
+                            if params.match_materials_to_script
+                            else params.video_concat_mode
+                        ),
+                        audio_duration=audio_duration * params.video_count,
+                        max_clip_duration=params.video_clip_duration,
+                        match_script_order=params.match_materials_to_script,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "free stock fallback failed: "
+                        f"source={fallback_source}, "
+                        f"error={type(exc).__name__}: {exc}"
+                    )
+                    fallback_videos = []
+                if fallback_videos:
+                    logger.info(
+                        "free stock fallback succeeded: "
+                        f"source={fallback_source}, count={len(fallback_videos)}"
+                    )
+                    downloaded_videos = fallback_videos
+                    break
+
         if not downloaded_videos:
             _mark_task_failed(
                 task_id,

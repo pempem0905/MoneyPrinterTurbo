@@ -1,4 +1,5 @@
 import base64
+import binascii
 import json
 import os
 import shutil
@@ -23,27 +24,30 @@ def _read_keys(name: str) -> list[str]:
             return [value.strip()]
     except Exception:
         pass
-
-    # Also accept TOML-style arrays or simple comma/newline-separated values.
     try:
         value = toml.loads(f"value = {raw}")["value"]
         if isinstance(value, list):
             return [str(item).strip() for item in value if str(item).strip()]
     except Exception:
         pass
-
     parts = raw.replace("\n", ",").split(",")
     return [part.strip().strip('"').strip("'") for part in parts if part.strip().strip('"').strip("'")]
 
 
 def main() -> None:
+    source = "config_example"
     encoded = (os.getenv("MPT_BOOTSTRAP_CONFIG_B64") or "").strip()
     if encoded:
-        CONFIG.write_bytes(base64.b64decode(encoded))
-        source = "full_config_b64"
+        try:
+            CONFIG.write_bytes(base64.b64decode(encoded, validate=True))
+            # Validate the decoded payload before trusting it.
+            toml.load(CONFIG)
+            source = "full_config_b64"
+        except (binascii.Error, ValueError, OSError, toml.TomlDecodeError):
+            shutil.copyfile(EXAMPLE, CONFIG)
+            source = "config_example_fallback"
     else:
         shutil.copyfile(EXAMPLE, CONFIG)
-        source = "config_example"
 
     cfg = toml.load(CONFIG)
     app = cfg.setdefault("app", {})
@@ -67,7 +71,6 @@ def main() -> None:
     with CONFIG.open("w", encoding="utf-8") as fh:
         toml.dump(cfg, fh)
 
-    # Do not print any secret values.
     counts = " ".join(f"{key}={value}" for key, value in provider_counts.items())
     print(f"STAGING_CONFIG_READY source={source} {counts} auth={'on' if bool(app.get('api_key')) else 'off'}")
 

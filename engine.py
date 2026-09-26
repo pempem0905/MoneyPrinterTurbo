@@ -10,6 +10,7 @@ import os
 import shutil
 import signal
 import subprocess
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +28,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 def _ensure_demo_material() -> None:
-    """Create one tiny local MP4 for a real zero-key smoke test."""
+    """Create one small CC0 local MP4 for a zero-key end-to-end smoke test."""
     if not _env_flag("MPT_CREATE_DEMO_MATERIAL", True):
         return
 
@@ -37,8 +38,89 @@ def _ensure_demo_material() -> None:
     if target.is_file() and target.stat().st_size > 10_000:
         return
 
-    cmd = [
-        "ffmpeg",
+    source_url = (
+        os.getenv(
+            "MPT_DEMO_MATERIAL_URL",
+            "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4",
+        ).strip()
+    )
+    downloaded = target_dir / ".mpt-demo-source.mp4"
+    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+
+    try:
+        request = urllib.request.Request(
+            source_url,
+            headers={"User-Agent": "MoneyPrinterTurbo-staging-smoke/1.0"},
+        )
+        max_bytes = 64 * 1024 * 1024
+        total = 0
+        with urllib.request.urlopen(request, timeout=45) as response, downloaded.open(
+            "wb"
+        ) as fp:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise RuntimeError("demo material download exceeded 64 MiB")
+                fp.write(chunk)
+
+        if downloaded.stat().st_size < 10_000:
+            raise RuntimeError("downloaded demo material is unexpectedly small")
+
+        cmd = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-stream_loop",
+            "-1",
+            "-i",
+            str(downloaded),
+            "-t",
+            "8",
+            "-an",
+            "-vf",
+            "scale=540:960:force_original_aspect_ratio=increase,crop=540:960",
+            "-r",
+            "30",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "28",
+            "-threads",
+            "1",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(target),
+        ]
+        subprocess.run(cmd, check=True, timeout=120)
+        logger.info(
+            "created built-in CC0 real-footage demo material: {} (source={})",
+            target.name,
+            source_url,
+        )
+        return
+    except Exception as exc:
+        logger.warning(
+            "could not prepare CC0 real-footage demo material; "
+            "falling back to synthetic smoke clip: {}",
+            exc,
+        )
+    finally:
+        try:
+            downloaded.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    fallback_cmd = [
+        ffmpeg,
         "-hide_banner",
         "-loglevel",
         "error",
@@ -46,7 +128,7 @@ def _ensure_demo_material() -> None:
         "-f",
         "lavfi",
         "-i",
-        "testsrc2=size=1080x1920:rate=30",
+        "testsrc2=size=540x960:rate=30",
         "-t",
         "8",
         "-an",
@@ -63,10 +145,10 @@ def _ensure_demo_material() -> None:
         str(target),
     ]
     try:
-        subprocess.run(cmd, check=True, timeout=90)
-        logger.info("created built-in demo material: {}", target.name)
+        subprocess.run(fallback_cmd, check=True, timeout=90)
+        logger.info("created synthetic fallback demo material: {}", target.name)
     except Exception as exc:
-        logger.warning("could not create demo material: {}", exc)
+        logger.warning("could not create fallback demo material: {}", exc)
 
 
 def _is_valid_mp4(path_value: str | os.PathLike[str] | None) -> bool:
@@ -248,10 +330,12 @@ def _ffmpeg_combine_fallback(*args, **kwargs) -> str:
 
 
 def _ffmpeg_final_fallback(*args, **kwargs) -> bool:
-    """Low-memory final mux: copy H.264 video and encode narration audio only."""
+    """Low-memory final mux with optional subtitle burn-in."""
     video_path = str(_arg(args, kwargs, "video_path", 0, ""))
     audio_path = str(_arg(args, kwargs, "audio_path", 1, ""))
+    subtitle_path = str(_arg(args, kwargs, "subtitle_path", 2, "") or "")
     output_file = str(_arg(args, kwargs, "output_file", 3, ""))
+    params = _arg(args, kwargs, "params", 4, None)
 
     if not _is_valid_mp4(video_path):
         raise RuntimeError("cloud final fallback: combined video is missing")
@@ -260,38 +344,60 @@ def _ffmpeg_final_fallback(*args, **kwargs) -> bool:
 
     ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
-    copy_mux = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        video_path,
-        "-i",
-        audio_path,
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "160k",
-        "-shortest",
-        "-movflags",
-        "+faststart",
-        output_file,
-    ]
-    try:
-        _run_ffmpeg(copy_mux, label="cloud final stream-copy fallback")
-        if _is_valid_mp4(output_file):
-            logger.success("cloud stream-copy fallback created final video: {}", output_file)
-            return True
-    except Exception as exc:
-        logger.warning("final stream-copy failed; trying one-thread encode: {}", exc)
+
+    subtitle_filter = None
+    subtitle_enabled = bool(getattr(params, "subtitle_enabled", False))
+    if subtitle_enabled and subtitle_path and Path(subtitle_path).is_file():
+        escaped_subtitle = (
+            subtitle_path.replace("\\", "\\\\")
+            .replace(":", "\\:")
+            .replace("'", "\\'")
+        )
+        subtitle_filter = (
+            f"subtitles='{escaped_subtitle}':"
+            "force_style='FontName=DejaVu Sans,FontSize=26,"
+            "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+            "BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=52'"
+        )
+        logger.info("cloud final fallback will burn subtitles: {}", subtitle_path)
+    elif subtitle_enabled:
+        logger.warning(
+            "cloud final fallback: subtitles requested but no readable subtitle file was found"
+        )
+
+    if not subtitle_filter:
+        copy_mux = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            video_path,
+            "-i",
+            audio_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            output_file,
+        ]
+        try:
+            _run_ffmpeg(copy_mux, label="cloud final stream-copy fallback")
+            if _is_valid_mp4(output_file):
+                logger.success("cloud stream-copy fallback created final video: {}", output_file)
+                return True
+        except Exception as exc:
+            logger.warning("final stream-copy failed; trying one-thread encode: {}", exc)
 
     low_memory_mux = [
         ffmpeg,
@@ -307,6 +413,10 @@ def _ffmpeg_final_fallback(*args, **kwargs) -> bool:
         "0:v:0",
         "-map",
         "1:a:0",
+    ]
+    if subtitle_filter:
+        low_memory_mux += ["-vf", subtitle_filter]
+    low_memory_mux += [
         "-c:v",
         "libx264",
         "-preset",

@@ -183,6 +183,14 @@ class TestCapabilitiesEndpoint(unittest.TestCase):
         for animation in options["subtitle_animation"]:
             VideoParams(video_subject="s", subtitle_animation=animation)
 
+    def test_direct_materials_advertise_ordered_scene_assembly(self):
+        direct = self._get().json()["data"]["direct_materials"]
+        self.assertEqual(direct["video_source"], "local")
+        self.assertTrue(direct["ordered_scene_assembly"])
+        self.assertEqual(direct["per_material_duration_param"], "use_material_durations")
+        self.assertEqual(direct["stock_import_endpoint"], "/api/v1/materials/import")
+        self.assertFalse(direct["mixed_provider_urls"])
+
     def test_requires_api_key_when_configured(self):
         config.app["api_key"] = "engine-secret"
         self.assertEqual(self._get().status_code, 401)

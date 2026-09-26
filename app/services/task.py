@@ -644,8 +644,12 @@ def get_video_materials(
 ):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
+        ordered = _uses_ordered_materials(params)
+        requested_count = len(params.video_materials or [])
         materials = video.preprocess_video(
-            materials=params.video_materials, clip_duration=params.video_clip_duration
+            materials=params.video_materials,
+            clip_duration=params.video_clip_duration,
+            **({"use_material_durations": True} if ordered else {}),
         )
         if not materials:
             _mark_task_failed(
@@ -654,6 +658,18 @@ def get_video_materials(
                 "no valid local video materials were found",
             )
             return None
+        if ordered and len(materials) != requested_count:
+            # Ordered scene assembly maps material N to scene N. Silently dropping
+            # an invalid material would shift every later scene, so fail instead.
+            _mark_task_failed(
+                task_id,
+                "materials",
+                f"ordered materials: {requested_count - len(materials)} of "
+                f"{requested_count} explicit materials are missing or invalid",
+            )
+            return None
+        if ordered:
+            _persist_ordered_material_manifest(task_id, materials)
         return [material_info.url for material_info in materials]
     elif params.video_source == "loomloom":
         if not isinstance(
@@ -791,6 +807,62 @@ def get_video_materials(
         return downloaded_videos
 
 
+def _uses_ordered_materials(params: VideoParams) -> bool:
+    """Explicit, ordered, per-scene local materials (Common OS scene rendering)."""
+    return bool(
+        getattr(params, "use_material_durations", False)
+        and params.video_source == "local"
+        and params.video_materials
+    )
+
+
+def _ordered_clip_durations(params: VideoParams) -> list[float]:
+    return [
+        float(item.duration) if item.duration and item.duration > 0
+        else float(params.video_clip_duration)
+        for item in params.video_materials or []
+    ]
+
+
+_MANIFEST_SOURCE_INFO_KEYS = (
+    "scene_id",
+    "scene_index",
+    "sub_index",
+    "provider",
+    "original_provider",
+    "asset_id",
+    "attribution",
+    "source_page",
+    "creator",
+    "search_term",
+    "remote_task_id",
+    "material_type",
+)
+
+
+def _persist_ordered_material_manifest(task_id: str, materials) -> None:
+    """Record which scene used which provider/material, for QC. Best effort."""
+    manifest = []
+    for index, item in enumerate(materials):
+        info = item.source_info if isinstance(item.source_info, dict) else {}
+        safe_info = {
+            key: value
+            for key, value in info.items()
+            if key in _MANIFEST_SOURCE_INFO_KEYS
+            and isinstance(value, (str, int, float, bool))
+            and len(str(value)) <= 500
+        }
+        manifest.append(
+            {
+                "order": index,
+                "local_file": path.basename(str(item.url or "")),
+                "duration": item.duration,
+                "source_info": safe_info,
+            }
+        )
+    task_artifacts.patch_script_data(task_id, ordered_materials=manifest)
+
+
 def _record_loomloom_run_reference(
     *, task_id: str, run_id: str, listing_version_id: str
 ) -> bool | None:
@@ -863,9 +935,12 @@ def generate_final_videos(
     final_video_paths = []
     combined_video_paths = []
     warnings = []
-    allocate_batch_materials = params.video_count > 1 and params.video_source in {
-        "pexels", "pixabay", "coverr", "local"
-    }
+    ordered_materials = _uses_ordered_materials(params)
+    allocate_batch_materials = (
+        not ordered_materials
+        and params.video_count > 1
+        and params.video_source in {"pexels", "pixabay", "coverr", "local"}
+    )
     source_usage = {}
     material_selections = []
     source_groups = (
@@ -880,7 +955,9 @@ def generate_final_videos(
         and bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
     )
     # Matching preserves keyword order; batch allocation varies each keyword's candidates.
-    if params.match_materials_to_script:
+    if ordered_materials:
+        video_concat_mode = VideoConcatMode.sequential
+    elif params.match_materials_to_script:
         video_concat_mode = VideoConcatMode.sequential
     elif params.video_count == 1:
         video_concat_mode = params.video_concat_mode
@@ -916,6 +993,11 @@ def generate_final_videos(
             threads=params.n_threads,
             clip_speed=params.video_clip_speed,
             **batch_options,
+            **(
+                {"clip_durations": _ordered_clip_durations(params)}
+                if ordered_materials
+                else {}
+            ),
         )
         if allocate_batch_materials:
             selected_sources = list(dict.fromkeys(used_video_paths))

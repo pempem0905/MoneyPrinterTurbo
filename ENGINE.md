@@ -126,19 +126,36 @@ read-only report for server-to-server integrations. It returns:
 URLs or raw `config.toml` values. Secrets are still managed only through `config.toml`,
 environment variables, or the allowlisted `/api/v1/provider-config` route.
 
-### Explicit per-scene materials — exact limitation
+### Explicit per-scene materials (ordered scene assembly)
 
 `video_materials` is honored **only** with `video_source="local"`. Each entry's `url` must be a
-file name inside the engine's `storage/local_videos` directory (upload with
-`POST /api/v1/video_materials`; path traversal is rejected). For every other source the engine
-searches/generates materials itself from `video_terms` and ignores `video_materials`.
+bare file name inside the engine's `storage/local_videos` directory (path traversal is rejected).
+The engine never downloads caller-supplied URLs.
 
-To mix providers per scene (shop media + Pexels + an AI clip), the caller resolves/downloads each
-scene's material, uploads it, then renders with `video_source="local"`,
-`video_concat_mode="sequential"` and the materials in scene order. In sequential mode each material
-contributes at most one `video_clip_duration`-long cut (scaled by `video_clip_speed`); the engine
-does not align cuts to per-scene narration timing. `source_info` on each material is persisted in
-the task's `script.json` for attribution.
+Getting materials into `local_videos` (all routes require `x-api-key`):
+
+| Material | Route | Result |
+| --- | --- | --- |
+| Shop / user media | `POST /api/v1/video_materials` (multipart, existing) | `{file}`; type, size (200 MB video / 20 MB image) and content validated; UUID storage name |
+| Stock | `POST /api/v1/materials/search` `{source: pexels\|pixabay\|coverr, search_term, video_aspect, minimum_duration, limit}` | `{candidates[]}` with `candidate_id`, asset id, duration, width/height, source page, creator — never the download URL |
+| Stock | `POST /api/v1/materials/import` `{candidate_id}` | `{file, reused}`; deterministic name `stock-<provider>-<asset>-<rendition>.mp4`, idempotent |
+| AI clip / image (paid) | `POST /api/v1/materials/generate` `{client_request_id, source, prompt, video_aspect, duration, paid_cost_approved: true}` | job `{status, file, remote_task_id}`; 402 without approval |
+| AI job status | `GET /api/v1/materials/generate/{client_request_id}` | same job record |
+
+Paid generation is idempotent per `client_request_id`: the job record is claimed atomically before
+any paid call, and every replay adopts the existing record — including `unconfirmed`,
+`download_failed` and interrupted jobs — without submitting a new paid task. Reusing an id with a
+different source/prompt/aspect/duration is a 409.
+
+Render with `video_source="local"`, `use_material_durations=true` and the materials in scene order
+(sub-clips of one scene simply follow each other). In that mode every material is required (a
+missing/invalid one fails the task instead of shifting later scenes), assembly is sequential, each
+material is cut to its own `duration` (images are rendered for that duration; `duration: 0` falls
+back to `video_clip_duration`), batch re-allocation is disabled, and an `ordered_materials` manifest
+(order, file, duration, whitelisted `source_info` such as `scene_id` / `original_provider`) is
+written to the task's `script.json` for QC. Remaining limitation: a material shorter than its
+target duration plays for its own length; if the total is shorter than the narration the engine's
+existing loop repeats clips from the start.
 
 `loomloom` requires an interactive confirmed quote and cannot be started from
 `POST /api/v1/videos` (`api_renderable=false`).

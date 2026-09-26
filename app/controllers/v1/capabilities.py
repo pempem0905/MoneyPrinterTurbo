@@ -300,6 +300,13 @@ def build_capabilities() -> dict[str, Any]:
             "list_endpoint": "/api/v1/video_materials",
             "mixed_provider_urls": False,
             "sequential_assembly": True,
+            # Ordered scene assembly: set use_material_durations=true to use every
+            # material exactly once, in order, cut to its own duration.
+            "ordered_scene_assembly": True,
+            "per_material_duration_param": "use_material_durations",
+            "stock_search_endpoint": "/api/v1/materials/search",
+            "stock_import_endpoint": "/api/v1/materials/import",
+            "generation_endpoint": "/api/v1/materials/generate",
             "local_materials_count": _local_materials_count(),
         },
     }

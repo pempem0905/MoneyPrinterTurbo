@@ -119,6 +119,11 @@ class VideoParams(BaseModel):
     video_materials: Optional[List[MaterialInfo]] = (
         None  # Materials used to generate the video
     )
+    # Ordered scene assembly for explicit local materials: when True (and
+    # video_source == "local") every material is required, used exactly once
+    # in the given order, and cut to its own ``duration`` (seconds, > 0) instead
+    # of ``video_clip_duration``. Default False keeps the legacy behavior.
+    use_material_durations: bool = False
 
     custom_audio_file: Optional[str] = (
         None  # Custom audio file path, will ignore TTS and can still use Whisper subtitles

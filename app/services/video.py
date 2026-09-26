@@ -717,7 +717,13 @@ def combine_videos(
     source_usage: dict[str, int] | None = None,
     source_groups: dict[str, str] | None = None,
     used_video_paths: List[str] | None = None,
+    clip_durations: List[float] | None = None,
 ) -> str:
+    """
+    ``clip_durations`` (optional, aligned 1:1 with ``video_paths``) gives each
+    source its own final cut length for ordered scene assembly. It is only
+    honored in sequential mode; otherwise ``max_clip_duration`` applies.
+    """
     audio_clip = AudioFileClip(audio_file)
     try:
         # 这里只需要读取旁白音频时长来决定素材视频拼接长度；后续不会再使用
@@ -755,31 +761,48 @@ def combine_videos(
     processed_clips = []
     subclipped_items = []
     video_duration = 0
-    for video_path in video_paths:
+    per_clip_targets = (
+        clip_durations
+        if clip_durations is not None
+        and len(clip_durations) == len(video_paths)
+        and getattr(video_concat_mode, "value", video_concat_mode)
+        == VideoConcatMode.sequential.value
+        else None
+    )
+    for path_index, video_path in enumerate(video_paths):
         clip = _open_video_clip_quietly(video_path)
         clip_duration = clip.duration
         clip_w, clip_h = clip.size
         close_clip(clip)
         
         start_time = 0
+        target_duration = max_clip_duration
+        if per_clip_targets is not None:
+            try:
+                candidate = float(per_clip_targets[path_index])
+            except (TypeError, ValueError):
+                candidate = 0.0
+            if math.isfinite(candidate) and candidate > 0:
+                target_duration = candidate
+        item_source_duration = target_duration * normalized_clip_speed
 
         while start_time < clip_duration:
-            end_time = min(start_time + source_clip_duration, clip_duration)
+            end_time = min(start_time + item_source_duration, clip_duration)
 
             # 保留所有有效分段。
             # 这样既不会丢掉“整段视频本身就短于 max_clip_duration”的素材，
             # 也不会吞掉长视频最后剩下的一小段尾部内容。
             if end_time > start_time:
-                subclipped_items.append(
-                    SubClippedVideoClip(
-                        file_path=video_path,
-                        start_time=start_time,
-                        end_time=end_time,
-                        width=clip_w,
-                        height=clip_h,
-                        source_file_path=video_path,
-                    )
+                subclipped_item = SubClippedVideoClip(
+                    file_path=video_path,
+                    start_time=start_time,
+                    end_time=end_time,
+                    width=clip_w,
+                    height=clip_h,
+                    source_file_path=video_path,
                 )
+                subclipped_item.target_duration = target_duration
+                subclipped_items.append(subclipped_item)
 
             start_time = end_time
             if video_concat_mode.value == VideoConcatMode.sequential.value:
@@ -862,8 +885,9 @@ def combine_videos(
                 shuffle_transition = random.choice(transition_funcs)
                 clip = shuffle_transition(clip)
 
-            if clip.duration > max_clip_duration:
-                clip = clip.subclipped(0, max_clip_duration)
+            clip_limit = getattr(subclipped_item, "target_duration", None) or max_clip_duration
+            if clip.duration > clip_limit:
+                clip = clip.subclipped(0, clip_limit)
                 
             # wirte clip to temp file
             clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
@@ -1521,7 +1545,9 @@ def render_image_zoom_video(image_path: str, clip_duration: int = 5) -> str:
         close_clip(clip)
 
 
-def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
+def preprocess_video(
+    materials: List[MaterialInfo], clip_duration=4, use_material_durations=False
+):
     # WebUI 在某些二次生成场景下可能传入空素材列表，这里直接返回空结果，避免抛出 NoneType 异常。
     if not materials:
         return []
@@ -1586,8 +1612,16 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                 # 探测尺寸时已经打开过一次素材，这里先释放探测句柄，再渲染
                 # 用于导出的图片片段。
                 close_clip(clip)
+                # Ordered scene assembly renders each image for its own scene
+                # duration; the legacy path keeps the shared clip duration.
+                image_duration = (
+                    material.duration
+                    if use_material_durations and material.duration
+                    and material.duration > 0
+                    else clip_duration
+                )
                 video_file = render_image_zoom_video(
-                    material_source_path, clip_duration
+                    material_source_path, image_duration
                 )
                 material.url = video_file
                 logger.success(f"image processed: {video_file}")

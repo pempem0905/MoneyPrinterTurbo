@@ -307,6 +307,7 @@ def build_capabilities() -> dict[str, Any]:
             "stock_search_endpoint": "/api/v1/materials/search",
             "stock_import_endpoint": "/api/v1/materials/import",
             "generation_endpoint": "/api/v1/materials/generate",
+            "stock_verify_endpoint": "/api/v1/materials/verify",
             "local_materials_count": _local_materials_count(),
         },
     }

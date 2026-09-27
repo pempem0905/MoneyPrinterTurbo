@@ -6,6 +6,7 @@ Routes (all under ``/api/v1``):
 * ``POST /materials/import``   - import one candidate into ``local_videos``
 * ``POST /materials/generate`` - claim/adopt one paid AI generation job
 * ``GET  /materials/generate/{client_request_id}`` - job status
+* ``POST /materials/verify``   - safe, non-billed stock API-key check
 
 Uploading caller-owned media (shop footage) reuses the existing
 ``POST /api/v1/video_materials`` route. Every returned ``file`` is a bare file
@@ -23,6 +24,7 @@ from app.controllers import base
 from app.controllers.v1.base import new_router
 from app.models.exception import HttpException
 from app.services import material_resolution as resolution
+from app.services import stock_verification
 from app.utils import utils
 
 router = new_router(dependencies=[Depends(base.verify_token)])
@@ -38,6 +40,10 @@ class MaterialSearchRequest(BaseModel):
 
 class MaterialImportRequest(BaseModel):
     candidate_id: str = Field(max_length=64)
+
+
+class MaterialVerifyRequest(BaseModel):
+    source: str = Field(max_length=32)
 
 
 class MaterialGenerateRequest(BaseModel):
@@ -106,3 +112,14 @@ def generate_material(request: Request, body: MaterialGenerateRequest):
 @router.get("/materials/generate/{client_request_id}", summary="Paid generation job status")
 def get_generated_material(request: Request, client_request_id: str):
     return _call(request, resolution.get_generation, client_request_id)
+
+
+@router.post("/materials/verify", summary="Verify one stock source's API key (no download, no cost)")
+def verify_material_source(request: Request, body: MaterialVerifyRequest):
+    try:
+        return utils.get_response(200, stock_verification.verify_stock_source(body.source))
+    except stock_verification.UnsupportedStockSourceError as exc:
+        request_id = base.get_task_id(request)
+        raise HttpException(
+            task_id=request_id, status_code=400, message=f"{request_id}: {exc}"
+        ) from exc
